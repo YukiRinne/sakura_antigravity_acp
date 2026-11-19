@@ -1,0 +1,734 @@
+"""ACP v1 newline-delimited JSON-RPC over an owned stdio link."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from collections import deque
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
+
+from .config import AgySettings
+from .context_usage import ContextUsage
+from .errors import AgyError, classified_error, remote_error
+from .notices import RetryNoticeGuard, TerminalNoticeGuard
+from .process import build_child_env, spawn, stop_process
+
+CLIENT_NAME = "sakura-agy-provider"
+CLIENT_VERSION = "0.1.0"
+
+
+@dataclass
+class Event:
+    kind: str
+    text: str = ""
+    result: dict | None = None
+
+
+@dataclass(frozen=True)
+class PermissionDenial:
+    method: str
+    tool_name: str | None
+    tool_call_id: str | None
+
+
+class _AgentTextGuard:
+    """Hold possible standalone CLI failure lines, including split chunks."""
+
+    markers = (
+        "Agent execution terminated due to error.",
+        "⚠ Agent execution terminated due to error.",
+        "⚠️ Agent execution terminated due to error.",
+    )
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.line_start = True
+        self.notices = TerminalNoticeGuard()
+        self.retries = RetryNoticeGuard()
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        text = self.retries.feed(text, final=final)
+        if self.retries.fast_fail_code:
+            raise classified_error(self.retries.fast_fail_code)
+        text = self.pending + self.notices.feed(text, final=final)
+        self.pending = ""
+        output: list[str] = []
+        while text:
+            line, newline, rest = text.partition("\n")
+            if self.line_start:
+                candidate = line.strip()
+                if candidate in self.markers and (newline or final):
+                    code = self.retries.error_code or "UPSTREAM"
+                    raise AgyError(code, "agy agent 执行失败，请检查官方 CLI。")
+                possible = any(
+                    marker.startswith(line.lstrip()) or (candidate == marker)
+                    for marker in self.markers
+                )
+                if not newline and not final and possible:
+                    self.pending = line
+                    break
+            output.append(line + newline)
+            self.line_start = bool(newline)
+            text = rest
+        return "".join(output)
+
+
+class AcpClient:
+    def __init__(self, settings: AgySettings) -> None:
+        self.settings = settings
+        self.proc: asyncio.subprocess.Process | None = None
+        self.pending: dict[int, asyncio.Future] = {}
+        self.next_id = 0
+        self.write_lock = asyncio.Lock()
+        self.events: asyncio.Queue[Event] = asyncio.Queue(maxsize=128)
+        self.session_id: str | None = None
+        self.capabilities: dict = {}
+        self.failed: AgyError | None = None
+        self.failure_event = asyncio.Event()
+        self.reader: asyncio.Task | None = None
+        self.stderr_reader: asyncio.Task | None = None
+        self.active = False
+        self.output_bytes = 0
+        self.closed = False
+        self.initialized = False
+        self.close_lock = asyncio.Lock()
+        self.tool_broker = None
+        self.permission_errors: list[PermissionDenial] = []
+        self.permission_grants: set[str] = set()
+        self.prompt_deadline = 0.0
+        self.prompt_terminal = False
+        self.prompt_request_id: int | None = None
+        self.text_guard = _AgentTextGuard()
+        self.stage = "idle"
+        self.diagnostic_epoch = 0
+        self.stderr_diagnostics: deque[tuple[str, str]] = deque(maxlen=32)
+        self.latest_usage: dict | None = None
+        self.latest_usage_source: str | None = None
+        self.context_usage = ContextUsage(
+            settings.context_compaction_min_peak,
+            settings.context_compaction_drop_percent,
+        )
+        self.prompt_sent = False
+
+    @property
+    def alive(self) -> bool:
+        return (
+            not self.closed
+            and not self.failed
+            and self.proc is not None
+            and self.proc.returncode is None
+        )
+
+    async def start(self, argv: list[str], cwd: Path) -> None:
+        async with self.close_lock:
+            if self.closed:
+                raise AgyError("CLOSED", "agy 连接已关闭。")
+            self.proc = await spawn(argv, cwd, env=build_child_env(self.settings))
+            self.reader = asyncio.create_task(self._read(), name="agy:stdout")
+            self.stderr_reader = asyncio.create_task(
+                self._drain_stderr(), name="agy:stderr"
+            )
+        try:
+            result = await self.request(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION},
+                },
+                self.settings.startup_timeout,
+            )
+            if result.get("protocolVersion") != 1:
+                raise AgyError("PROTOCOL", "agy 未协商 ACP v1。")
+            self.initialized = True
+            self.capabilities = result.get("agentCapabilities") or {}
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _write(self, obj: dict, *, cancelling: bool = False) -> None:
+        if self.failed and not cancelling:
+            raise self.failed
+        if (
+            self.closed
+            or not self.proc
+            or self.proc.returncode is not None
+            or not self.proc.stdin
+        ):
+            raise AgyError("TRANSPORT", "agy 连接已关闭。")
+        data = (
+            json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        async with self.write_lock:
+            try:
+                self.proc.stdin.write(data)
+                if obj.get("method") == "session/prompt":
+                    self.prompt_sent = True
+                await asyncio.wait_for(
+                    self.proc.stdin.drain(), self.settings.startup_timeout
+                )
+            except (BrokenPipeError, ConnectionError):
+                raise AgyError("TRANSPORT", "agy 输入管道已关闭。") from None
+
+    async def request(self, method: str, params: dict, timeout: int) -> dict:
+        self.stage = (
+            method
+            if method
+            in {
+                "initialize",
+                "session/new",
+                "session/set_config_option",
+                "session/prompt",
+            }
+            else "rpc"
+        )
+        self.diagnostic_epoch += 1
+        self.stderr_diagnostics.clear()
+        self.next_id += 1
+        request_id = self.next_id
+        if method == "session/prompt":
+            self.prompt_request_id = request_id
+        future = asyncio.get_running_loop().create_future()
+        self.pending[request_id] = future
+        try:
+            async with asyncio.timeout(timeout):
+                await self._write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "method": method,
+                        "params": params,
+                    }
+                )
+                result = await future
+            if not isinstance(result, dict):
+                raise AgyError("PROTOCOL", "ACP 返回了非对象结果。")
+            return result
+        except TimeoutError:
+            raise self._diagnose(
+                AgyError("TIMEOUT", f"ACP {self.stage} 超时。", stage=self.stage)
+            ) from None
+        except AgyError as exc:
+            exc.rpc_stage = self.stage
+            if exc.code == "TRANSPORT":
+                raise await self._transport_error(exc) from None
+            raise
+        finally:
+            self.pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+    async def new_session(
+        self,
+        cwd: Path,
+        mcp_servers: list | None = None,
+        *,
+        system_prompt: str = "",
+    ) -> dict:
+        params: dict = {"cwd": str(cwd), "mcpServers": mcp_servers or []}
+        meta = (
+            self.capabilities.get("_meta")
+            if isinstance(self.capabilities, dict)
+            else None
+        )
+        agy_meta = meta.get("antigravity") if isinstance(meta, dict) else None
+        sp_meta = agy_meta.get("systemPrompt") if isinstance(agy_meta, dict) else None
+        if (
+            system_prompt.strip()
+            and isinstance(sp_meta, dict)
+            and sp_meta.get("append") is True
+        ):
+            params["_meta"] = {"antigravity": {"systemPrompt": {"append": system_prompt}}}
+        result = await self.request(
+            "session/new",
+            params,
+            self.settings.startup_timeout,
+        )
+        sid = result.get("sessionId")
+        if not isinstance(sid, str) or not sid:
+            raise AgyError("PROTOCOL", "agy 没有返回 sessionId。")
+        self.session_id = sid
+        self.context_usage = ContextUsage(
+            self.settings.context_compaction_min_peak,
+            self.settings.context_compaction_drop_percent,
+        )
+        return result
+
+    async def set_option(self, option: str, value: str) -> dict:
+        return await self.request(
+            "session/set_config_option",
+            {
+                "sessionId": self.session_id,
+                "configId": option,
+                "value": value,
+            },
+            self.settings.startup_timeout,
+        )
+
+    def _diagnose(self, error: AgyError) -> AgyError:
+        if error.code not in {"UPSTREAM", "TRANSPORT", "TIMEOUT", "STARTUP_EXIT"}:
+            return error
+        priority = (
+            "CLI_WRAPPER",
+            "PROXY_AUTH",
+            "PROXY",
+            "TLS",
+            "NETWORK",
+            "AUTH",
+            "QUOTA",
+            "RATE_LIMIT",
+            "TIMEOUT",
+        )
+        codes = {code for code, stage in self.stderr_diagnostics if stage == self.stage}
+        for code in priority:
+            if code in codes:
+                return classified_error(
+                    code, stage=self.stage, exit_code=error.exit_code
+                )
+        return error
+
+    async def _transport_error(self, error: AgyError) -> AgyError:
+        if self.proc is None:
+            return self._diagnose(error)
+        exited = asyncio.create_task(self.proc.wait())
+        tasks: set[asyncio.Task] = {exited}
+        if self.stderr_reader:
+            tasks.add(self.stderr_reader)
+        try:
+            await asyncio.wait(tasks, timeout=0.1)
+        finally:
+            if not exited.done():
+                exited.cancel()
+            await asyncio.gather(exited, return_exceptions=True)
+        exit_code = self.proc.returncode
+        if not self.initialized and exit_code is not None:
+            error = classified_error(
+                "STARTUP_EXIT", stage=self.stage, exit_code=exit_code
+            )
+        else:
+            error.exit_code = exit_code
+        return self._diagnose(error)
+
+    def _fail(self, error: AgyError) -> None:
+        self.failed = self.failed or self._diagnose(error)
+        self.failure_event.set()
+        for future in list(self.pending.values()):
+            if not future.done():
+                future.set_exception(self.failed)
+
+    async def _read(self) -> None:
+        assert self.proc and self.proc.stdout
+        invalid_frames = 0
+        try:
+            while line := await self.proc.stdout.readline():
+                try:
+                    obj = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    invalid_frames += 1
+                    if invalid_frames > 8:
+                        raise AgyError(
+                            "PROTOCOL", "agy stdout 不是有效的 ACP JSON-RPC 流。"
+                        )
+                    continue
+                if not isinstance(obj, dict) or obj.get("jsonrpc") != "2.0":
+                    raise AgyError("PROTOCOL", "收到无效的 JSON-RPC 帧。")
+                if "method" in obj:
+                    if "id" in obj:
+                        await self._reject_request(obj)
+                    elif obj["method"] == "session/update":
+                        self._on_update(obj.get("params"))
+                    elif obj["method"] in {"session/error", "session/agent_error"}:
+                        params = obj.get("params")
+                        if self._current_update(params):
+                            self._record_usage(params, "acp_error")
+                            raise remote_error(params.get("error", params))
+                else:
+                    request_id = obj.get("id")
+                    if type(request_id) is not int:
+                        continue
+                    future = self.pending.get(request_id)
+                    if future and not future.done():
+                        if request_id == self.prompt_request_id:
+                            self.prompt_terminal = True
+                            if self.tool_broker is not None:
+                                self.tool_broker.turn_active = False
+                        if "error" in obj:
+                            self._record_usage_from_error(obj)
+                            future.set_exception(
+                                self._diagnose(remote_error(obj["error"]))
+                            )
+                        else:
+                            self._record_usage(obj.get("result"), "acp_terminal")
+                            future.set_result(obj.get("result"))
+                await asyncio.sleep(0)
+            error = await self._transport_error(
+                AgyError("TRANSPORT", "agy 进程退出或关闭了输出管道，请检查 CLI。")
+            )
+            self._fail(error)
+        except asyncio.CancelledError:
+            raise
+        except AgyError as exc:
+            self._fail(exc)
+        except Exception:
+            self._fail(AgyError("PROTOCOL", "ACP 读取失败或单帧超过 1 MiB。"))
+
+    async def _drain_stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        window = b""
+        epoch = self.diagnostic_epoch
+        while chunk := await self.proc.stderr.read(8192):
+            if epoch != self.diagnostic_epoch:
+                window = b""
+                epoch = self.diagnostic_epoch
+            window = (window + chunk)[-16384:]
+            text = window.decode("utf-8", "replace")
+            for line in text.splitlines():
+                code = remote_error(line).code
+                if code == "AUTH" and re.search(r"not.logged.in", line, re.IGNORECASE):
+                    continue
+                if code != "UPSTREAM":
+                    entry = (code, self.stage)
+                    if entry not in self.stderr_diagnostics:
+                        self.stderr_diagnostics.append(entry)
+            window = window.rsplit(b"\n", 1)[-1] if b"\n" in window else window
+
+    def _mcp_permission_option(self, params: object) -> tuple[str, str] | None:
+        broker = self.tool_broker
+        if (
+            not self.alive
+            or not self._current_update(params)
+            or self.prompt_terminal
+            or asyncio.get_running_loop().time() >= self.prompt_deadline
+            or not isinstance(self.session_id, str)
+            or not self.session_id
+            or broker is None
+            or broker.closed
+            or not broker.turn_active
+            or broker.session_id != self.session_id
+        ):
+            return None
+        assert isinstance(params, dict)
+        call = params.get("toolCall")
+        if not isinstance(call, dict):
+            return None
+        ident = call.get("toolCallId")
+        if not isinstance(ident, str) or not ident or ident in self.permission_grants:
+            return None
+        name = broker.snapshot.notification_name(call.get("name"))
+        observed = broker.notifications.get(ident)
+        if (
+            name is None
+            or observed is None
+            or observed[0] != name
+            or observed[1] not in ("pending", "in_progress")
+            or call.get("status") not in ("pending", "in_progress")
+        ):
+            return None
+        options = params.get("options")
+        if not isinstance(options, list):
+            return None
+        identifiers = set()
+        once = []
+        for option in options:
+            if not isinstance(option, dict):
+                return None
+            option_id = option.get("optionId")
+            if (
+                not isinstance(option_id, str)
+                or not option_id.strip()
+                or option_id in identifiers
+                or option.get("kind")
+                not in ("allow_once", "allow_always", "reject_once", "reject_always")
+            ):
+                return None
+            identifiers.add(option_id)
+            if option.get("kind") == "allow_once":
+                once.append(option_id)
+        return (ident, once[0]) if len(once) == 1 else None
+
+    async def _reject_request(self, obj: dict) -> None:
+        reply: dict = {"jsonrpc": "2.0", "id": obj["id"]}
+        if obj["method"] == "session/request_permission":
+            grant = self._mcp_permission_option(obj.get("params"))
+            if grant is not None:
+                ident, option_id = grant
+                self.permission_grants.add(ident)
+                reply["result"] = {
+                    "outcome": {"outcome": "selected", "optionId": option_id}
+                }
+            else:
+                reply["result"] = {"outcome": {"outcome": "cancelled"}}
+                params = obj.get("params")
+                if (
+                    self._current_update(params)
+                    and not self.prompt_terminal
+                    and asyncio.get_running_loop().time() < self.prompt_deadline
+                    and len(self.permission_errors) < 128
+                ):
+                    assert isinstance(params, dict)
+                    call = params.get("toolCall")
+                    call = call if isinstance(call, dict) else {}
+                    name, ident = call.get("name"), call.get("toolCallId")
+                    self.permission_errors.append(
+                        PermissionDenial(
+                            method="session/request_permission",
+                            tool_name=name[:256] if isinstance(name, str) else None,
+                            tool_call_id=ident[:256] if isinstance(ident, str) else None,
+                        )
+                    )
+        else:
+            reply["error"] = {
+                "code": -32601,
+                "message": "Sakura model provider does not offer this capability",
+            }
+        await self._write(reply)
+
+    def _record_usage(self, payload: object, source: str) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        raw = payload.get("usage")
+        if not isinstance(raw, dict):
+            return False
+        if (
+            self.latest_usage is not None
+            and self.latest_usage_source == "acp_terminal"
+            and source != "acp_terminal"
+        ):
+            return False
+        self.latest_usage = dict(raw)
+        self.latest_usage_source = source
+        return True
+
+    def _record_usage_from_error(self, obj: dict) -> None:
+        if self._record_usage(obj, "acp_error"):
+            return
+        err = obj.get("error")
+        if isinstance(err, dict):
+            if self._record_usage(err, "acp_error"):
+                return
+            self._record_usage(err.get("data"), "acp_error")
+
+    def _current_update(self, params: object) -> bool:
+        return (
+            isinstance(params, dict)
+            and params.get("sessionId") == self.session_id
+            and self.active
+        )
+
+    def _on_update(self, params: object) -> None:
+        if not self._current_update(params):
+            return
+        assert isinstance(params, dict)
+        update = params.get("update", {})
+        if not isinstance(update, dict):
+            return
+        if self._record_usage(update, "acp_update") or self._record_usage(
+            params, "acp_update"
+        ):
+            try:
+                self.events.put_nowait(
+                    Event(
+                        "usage",
+                        result={"usage": self.latest_usage, "source": "acp_update"},
+                    )
+                )
+            except asyncio.QueueFull:
+                pass
+        kind = update.get("sessionUpdate")
+        if kind == "usage_update":
+            self.context_usage.observe(update)
+            return
+        if kind in {"current_model_update", "config_option_update"}:
+            self.context_usage.observe({})
+            self.context_usage.model_known = False
+            return
+        if kind in {"error", "agent_error", "session_error", "agent_execution_error"}:
+            raise remote_error(update.get("error", update))
+        if kind in {"tool_call", "tool_call_update"}:
+            tail = self.text_guard.feed("", final=True)
+            if tail:
+                try:
+                    self.events.put_nowait(Event("text", tail))
+                except asyncio.QueueFull:
+                    raise AgyError("BACKPRESSURE", "流式消费者过慢。") from None
+            if self.tool_broker is not None:
+                self.tool_broker.observe(update)
+                return
+            raise AgyError(
+                "TOOLS_DISABLED",
+                "AGY 尝试调用内置工具；已中止该轮，请检查工具开关。",
+            )
+        kinds = {"agent_message_chunk": "text", "agent_thought_chunk": "thought"}
+        if kind not in kinds:
+            return
+        content = update.get("content", {})
+        if not isinstance(content, dict) or content.get("type") != "text":
+            raise AgyError("UNSUPPORTED", "AGY 返回了不支持的非文本内容。")
+        text = content.get("text", "")
+        if not isinstance(text, str):
+            raise AgyError("PROTOCOL", "ACP 文本块格式不正确。")
+        self.output_bytes += len(text.encode("utf-8"))
+        if self.output_bytes > self.settings.max_output_bytes:
+            raise AgyError("OUTPUT_LIMIT", "AGY 本轮输出超过插件字节上限。")
+        if kind == "agent_message_chunk":
+            text = self.text_guard.feed(text)
+        if text:
+            try:
+                self.events.put_nowait(Event(kinds[kind], text))
+            except asyncio.QueueFull:
+                raise AgyError(
+                    "BACKPRESSURE", "流式消费者过慢，已中止请求以限制内存占用。"
+                ) from None
+
+    async def generate(self, prompt: str | list[dict]) -> AsyncIterator[Event]:
+        if self.active:
+            raise AgyError("BUSY", "同一 ACP 会话不能同时生成。")
+        self.events = asyncio.Queue(maxsize=128)
+        self.output_bytes = 0
+        self.text_guard = _AgentTextGuard()
+        self.permission_grants.clear()
+        self.permission_errors.clear()
+        self.active = True
+        if self.tool_broker is not None:
+            self.tool_broker.turn_active = True
+        self.prompt_terminal = False
+        self.prompt_request_id = None
+        self.prompt_sent = False
+        self.latest_usage = None
+        self.latest_usage_source = None
+        self.prompt_deadline = (
+            asyncio.get_running_loop().time() + self.settings.request_timeout
+        )
+        completed = False
+        response = asyncio.create_task(
+            self.request(
+                "session/prompt",
+                {
+                    "sessionId": self.session_id,
+                    "prompt": [{"type": "text", "text": prompt}]
+                    if isinstance(prompt, str)
+                    else prompt,
+                },
+                self.settings.request_timeout,
+            ),
+            name="agy:prompt",
+        )
+
+        def prompt_finished(task: asyncio.Task) -> None:
+            self.prompt_terminal = True
+            if self.tool_broker is not None:
+                self.tool_broker.turn_active = False
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error is not None and self.tool_broker is not None:
+                self._fail(
+                    error
+                    if isinstance(error, AgyError)
+                    else AgyError("TRANSPORT", "工具轮的 ACP prompt 已结束。")
+                )
+            elif self.tool_broker is not None and self.tool_broker.pending:
+                self._fail(
+                    AgyError(
+                        "TOOL_TERMINATED",
+                        "原 ACP prompt 已结束，尚未完成的工具请求已取消。",
+                    )
+                )
+
+        response.add_done_callback(prompt_finished)
+        getter = None
+        try:
+            while True:
+                if self.failed:
+                    raise self.failed
+                if not self.events.empty():
+                    yield self.events.get_nowait()
+                    continue
+                if response.done():
+                    result = await response
+                    if self._record_usage(result, "acp_terminal"):
+                        yield Event(
+                            "usage",
+                            result={"usage": self.latest_usage, "source": "acp_terminal"},
+                        )
+                    if result.get("error") is not None:
+                        self._record_usage(result.get("error"), "acp_error")
+                        raise self._diagnose(remote_error(result["error"]))
+                    if result.get("stopReason") in {
+                        "error",
+                        "failed",
+                        "failure",
+                        "agent_error",
+                        "execution_error",
+                        "internal_error",
+                    }:
+                        code = self.text_guard.retries.error_code or "UPSTREAM"
+                        raise self._diagnose(
+                            AgyError(code, "agy agent 执行失败，请检查官方 CLI。")
+                        )
+                    remaining = self.text_guard.feed("", final=True)
+                    if remaining:
+                        yield Event("text", remaining)
+                    if self.text_guard.retries.error_code:
+                        result = dict(
+                            result, agy_retry_error=self.text_guard.retries.error_code
+                        )
+                    completed = True
+                    yield Event("done", result=result)
+                    return
+                getter = asyncio.create_task(self.events.get())
+                await asyncio.wait(
+                    (getter, response), return_when=asyncio.FIRST_COMPLETED
+                )
+                if getter.done():
+                    event = getter.result()
+                    getter = None
+                    yield event
+                else:
+                    getter.cancel()
+                    await asyncio.gather(getter, return_exceptions=True)
+                    getter = None
+        finally:
+            self.active = False
+            if self.tool_broker is not None:
+                self.tool_broker.turn_active = False
+            if getter is not None:
+                getter.cancel()
+                await asyncio.gather(getter, return_exceptions=True)
+            if not completed:
+                try:
+                    await asyncio.wait_for(
+                        self._write(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/cancel",
+                                "params": {"sessionId": self.session_id},
+                            },
+                            cancelling=True,
+                        ),
+                        2,
+                    )
+                except (TimeoutError, AgyError, OSError):
+                    pass
+            response.cancel()
+            await asyncio.gather(response, return_exceptions=True)
+
+    async def close(self) -> None:
+        async with self.close_lock:
+            if self.closed:
+                return
+            self.closed = True
+            self._fail(AgyError("CLOSED", "agy 会话已关闭。"))
+            try:
+                if self.proc:
+                    await stop_process(self.proc)
+            finally:
+                tasks = [task for task in (self.reader, self.stderr_reader) if task]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
